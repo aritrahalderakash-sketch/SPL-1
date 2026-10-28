@@ -1,14 +1,20 @@
 
 
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include <float.h>
 #include "gdal.h"
 #include "cpl_conv.h"
 
 #define DATE_COUNT 2
 #define BAND_COUNT 4
+#define EXPECTED_WIDTH 512
+#define EXPECTED_HEIGHT 512
+#define GEO_TOLERANCE 1e-8
 
 enum
 {
@@ -48,6 +54,364 @@ const char *filePaths[DATE_COUNT][BAND_COUNT] =
 }
 };
 
+int closeEnough(double a, double b)
+{
+if (!isfinite(a) || !isfinite(b))
+return 0;
+
+return fabs(a - b) <= GEO_TOLERANCE;
+}
+
+int sameProjection(
+GDALDatasetH reference,
+GDALDatasetH current)
+{
+const char *referenceProjection =
+GDALGetProjectionRef(reference);
+
+const char *currentProjection =
+GDALGetProjectionRef(current);
+
+if (referenceProjection == NULL ||
+currentProjection == NULL)
+return 0;
+
+if (referenceProjection[0] == '\0' ||
+currentProjection[0] == '\0')
+return 0;
+
+return strcmp(referenceProjection,
+currentProjection) == 0;
+}
+
+int readTransform(
+GDALDatasetH dataset,
+double transform[6])
+{
+if (GDALGetGeoTransform(dataset, transform) != CE_None)
+return 0;
+
+for (int i = 0; i < 6; i++)
+{
+if (!isfinite(transform[i]))
+return 0;
+}
+
+double determinant =
+transform[1] * transform[5] -
+transform[2] * transform[4];
+
+if (!isfinite(determinant) ||
+fabs(determinant) < 1e-15)
+return 0;
+
+return 1;
+}
+
+int sameTransform(
+const double reference[6],
+const double current[6])
+{
+for (int i = 0; i < 6; i++)
+{
+if (!closeEnough(reference[i], current[i]))
+return 0;
+}
+
+return 1;
+}
+
+void calculateCorner(
+const double transform[6],
+double pixel,
+double line,
+double *x,
+double *y)
+{
+*x = transform[0] +
+pixel * transform[1] +
+line * transform[2];
+
+*y = transform[3] +
+pixel * transform[4] +
+line * transform[5];
+}
+
+int sameExtent(
+const double referenceTransform[6],
+const double currentTransform[6],
+int width,
+int height)
+{
+double pixelCorners[4] =
+{
+0.0, (double)width, (double)width, 0.0
+};
+
+double lineCorners[4] =
+{
+0.0, 0.0, (double)height, (double)height
+};
+
+for (int i = 0; i < 4; i++)
+{
+double referenceX;
+double referenceY;
+double currentX;
+double currentY;
+
+calculateCorner(
+referenceTransform,
+pixelCorners[i],
+lineCorners[i],
+&referenceX,
+&referenceY);
+
+calculateCorner(
+currentTransform,
+pixelCorners[i],
+lineCorners[i],
+&currentX,
+&currentY);
+
+if (!closeEnough(referenceX, currentX) ||
+!closeEnough(referenceY, currentY))
+return 0;
+}
+
+return 1;
+}
+
+int validateDimensions(
+GDALDatasetH dataset,
+const char *path)
+{
+int width = GDALGetRasterXSize(dataset);
+int height = GDALGetRasterYSize(dataset);
+
+if (width != EXPECTED_WIDTH ||
+height != EXPECTED_HEIGHT)
+{
+fprintf(stderr,
+"INVALID: Expected %dx%d: %s "
+"(actual %dx%d)\n",
+EXPECTED_WIDTH,
+EXPECTED_HEIGHT,
+path,
+width,
+height);
+
+return 0;
+}
+
+return 1;
+}
+
+int validateBandCount(
+GDALDatasetH dataset,
+const char *path)
+{
+if (GDALGetRasterCount(dataset) != 1)
+{
+fprintf(stderr,
+"INVALID: Expected one raster band: %s\n",
+path);
+
+return 0;
+}
+
+return 1;
+}
+
+int validateMetadata(
+GDALDatasetH reference,
+GDALDatasetH current,
+const double referenceTransform[6],
+const char *path,
+int width,
+int height)
+{
+double currentTransform[6];
+
+if (!sameProjection(reference, current))
+{
+fprintf(stderr,
+"INVALID: CRS mismatch: %s\n",
+path);
+
+return 0;
+}
+
+if (!readTransform(current, currentTransform))
+{
+fprintf(stderr,
+"INVALID: Missing or invalid geotransform: %s\n",
+path);
+
+return 0;
+}
+
+if (!sameTransform(
+referenceTransform,
+currentTransform))
+{
+fprintf(stderr,
+"INVALID: Geotransform mismatch: %s\n",
+path);
+
+return 0;
+}
+
+if (!sameExtent(
+referenceTransform,
+currentTransform,
+width,
+height))
+{
+fprintf(stderr,
+"INVALID: Geographic extent mismatch: %s\n",
+path);
+
+return 0;
+}
+
+return 1;
+}
+
+int readBandPixels(
+GDALDatasetH dataset,
+float *buffer,
+int width,
+int height,
+const char *path)
+{
+GDALRasterBandH rasterBand =
+GDALGetRasterBand(dataset, 1);
+
+if (rasterBand == NULL)
+{
+fprintf(stderr,
+"INVALID: Cannot access raster band: %s\n",
+path);
+
+return 0;
+}
+
+CPLErr result = GDALRasterIO(
+rasterBand,
+GF_Read,
+0,
+0,
+width,
+height,
+buffer,
+width,
+height,
+GDT_Float32,
+0,
+0);
+
+if (result != CE_None)
+{
+fprintf(stderr,
+"INVALID: Cannot read pixel data: %s\n",
+path);
+
+return 0;
+}
+
+return 1;
+}
+
+int getNoDataInformation(
+GDALDatasetH dataset,
+double *noDataValue,
+int *hasNoData,
+const char *path)
+{
+GDALRasterBandH rasterBand =
+GDALGetRasterBand(dataset, 1);
+
+if (rasterBand == NULL)
+{
+fprintf(stderr,
+"INVALID: Cannot access band metadata: %s\n",
+path);
+
+return 0;
+}
+
+int success = 0;
+
+*noDataValue =
+GDALGetRasterNoDataValue(rasterBand, &success);
+
+*hasNoData = success;
+
+if (!success)
+{
+printf("NoData metadata not defined: %s\n", path);
+}
+else
+{
+printf("NoData value for %s: ", path);
+
+if (isnan(*noDataValue))
+printf("NaN\n");
+else
+printf("%.12g\n", *noDataValue);
+}
+
+return 1;
+}
+
+int isValidSample(
+float value,
+double noDataValue,
+int hasNoData)
+{
+if (!isfinite(value))
+return 0;
+
+if (hasNoData)
+{
+if (isnan(noDataValue))
+return 1;
+
+if (value == (float)noDataValue)
+return 0;
+}
+
+return 1;
+}
+
+int calculateIndex(
+float first,
+float second,
+double *result)
+{
+if (!isfinite(first) || !isfinite(second))
+return 0;
+
+double denominator =
+(double)first + (double)second;
+
+if (!isfinite(denominator) || denominator == 0.0)
+return 0;
+
+double numerator =
+(double)first - (double)second;
+
+double value = numerator / denominator;
+
+if (!isfinite(value) || fabs(value) > FLT_MAX)
+return 0;
+
+*result = value;
+
+return 1;
+}
+
 int main(void)
 {
 GDALAllRegister();
@@ -55,25 +419,28 @@ GDALAllRegister();
 GDALDatasetH datasets[DATE_COUNT][BAND_COUNT] = {{NULL}};
 
 float *bandData[DATE_COUNT][BAND_COUNT] = {{NULL}};
+
+unsigned char *bandValid[DATE_COUNT][BAND_COUNT] = {{NULL}};
+
+double noDataValues[DATE_COUNT][BAND_COUNT] = {{0}};
+int hasNoData[DATE_COUNT][BAND_COUNT] = {{0}};
+
 float *ndwiData[DATE_COUNT] = {NULL};
 float *ndviData[DATE_COUNT] = {NULL};
 
+unsigned char *ndwiValid[DATE_COUNT] = {NULL};
+unsigned char *ndviValid[DATE_COUNT] = {NULL};
+
 int width = 0;
 int height = 0;
-int referenceWidth = 0;
-int referenceHeight = 0;
-
-double referenceTransform[6] = {0};
-double currentTransform[6] = {0};
-
-char *referenceProjection = NULL;
 
 size_t totalPixels = 0;
 size_t totalStoredValues = 0;
 
-int status = EXIT_FAILURE;
+double referenceTransform[6] = {0};
 
-/* STEP 1: INPUT VALIDATION */
+int status = EXIT_FAILURE;
+int validationPassed = 0;
 
 printf("Starting input validation...\n\n");
 
@@ -81,186 +448,215 @@ for (int d = 0; d < DATE_COUNT; d++)
 {
 for (int b = 0; b < BAND_COUNT; b++)
 {
+const char *path = filePaths[d][b];
+
 datasets[d][b] =
-GDALOpen(filePaths[d][b], GA_ReadOnly);
+GDALOpen(path, GA_ReadOnly);
 
 if (datasets[d][b] == NULL)
 {
 fprintf(stderr,
-"ERROR: Cannot open file: %s\n",
-filePaths[d][b]);
+"INVALID: Cannot open file: %s\n",
+path);
+
 goto cleanup;
 }
 
-int currentWidth =
-GDALGetRasterXSize(datasets[d][b]);
+if (!validateDimensions(datasets[d][b], path))
+goto cleanup;
 
-int currentHeight =
-GDALGetRasterYSize(datasets[d][b]);
+if (!validateBandCount(datasets[d][b], path))
+goto cleanup;
+}
+}
 
-if (GDALGetRasterCount(datasets[d][b]) != 1)
+width = GDALGetRasterXSize(datasets[0][0]);
+height = GDALGetRasterYSize(datasets[0][0]);
+
+if (!readTransform(
+datasets[0][0],
+referenceTransform))
 {
 fprintf(stderr,
-"ERROR: Expected one raster band: %s\n",
-filePaths[d][b]);
+"INVALID: Reference geotransform is missing "
+"or invalid.\n");
+
 goto cleanup;
 }
 
-if (d == 0 && b == 0)
-{
-referenceWidth = currentWidth;
-referenceHeight = currentHeight;
+const char *referenceProjection =
+GDALGetProjectionRef(datasets[0][0]);
 
-if (GDALGetGeoTransform(
-datasets[d][b],
-referenceTransform) != CE_None)
+if (referenceProjection == NULL ||
+referenceProjection[0] == '\0')
 {
 fprintf(stderr,
-"ERROR: Cannot read geotransform.\n");
+"INVALID: Reference CRS is missing.\n");
+
 goto cleanup;
 }
-
-const char *projection =
-GDALGetProjectionRef(datasets[d][b]);
-
-if (projection == NULL || projection[0] == '\0')
-{
-fprintf(stderr,
-"ERROR: Reference CRS is missing.\n");
-goto cleanup;
-}
-
-referenceProjection = CPLStrdup(projection);
-
-if (referenceProjection == NULL)
-{
-fprintf(stderr,
-"ERROR: Cannot store reference CRS.\n");
-goto cleanup;
-}
-}
-else
-{
-if (currentWidth != referenceWidth ||
-currentHeight != referenceHeight)
-{
-fprintf(stderr,
-"ERROR: Image dimensions do not match: %s\n",
-filePaths[d][b]);
-goto cleanup;
-}
-
-if (GDALGetGeoTransform(
-datasets[d][b],
-currentTransform) != CE_None)
-{
-fprintf(stderr,
-"ERROR: Cannot read geotransform: %s\n",
-filePaths[d][b]);
-goto cleanup;
-}
-
-for (int i = 0; i < 6; i++)
-{
-if (fabs(currentTransform[i] -
-referenceTransform[i]) > 1e-8)
-{
-fprintf(stderr,
-"ERROR: Image alignment mismatch: %s\n",
-filePaths[d][b]);
-goto cleanup;
-}
-}
-
-const char *projection =
-GDALGetProjectionRef(datasets[d][b]);
-
-if (projection == NULL ||
-strcmp(projection, referenceProjection) != 0)
-{
-fprintf(stderr,
-"ERROR: CRS mismatch: %s\n",
-filePaths[d][b]);
-goto cleanup;
-}
-}
-}
-}
-
-width = referenceWidth;
-height = referenceHeight;
-totalPixels = (size_t)width * (size_t)height;
-
-printf("Input validation successful!\n");
-printf("Image dimensions: %d x %d\n\n", width, height);
-
-/* STEP 2: STORE ALL BAND PIXELS IN MEMORY */
 
 for (int d = 0; d < DATE_COUNT; d++)
 {
-printf("Reading image date: %s\n", dates[d]);
-
 for (int b = 0; b < BAND_COUNT; b++)
 {
-bandData[d][b] =
-malloc(totalPixels * sizeof(float));
+if (d == 0 && b == 0)
+continue;
 
-if (bandData[d][b] == NULL)
+if (!validateMetadata(
+datasets[0][0],
+datasets[d][b],
+referenceTransform,
+filePaths[d][b],
+width,
+height))
+{
+goto cleanup;
+}
+}
+}
+
+if ((size_t)width > SIZE_MAX / (size_t)height)
 {
 fprintf(stderr,
-"ERROR: Memory allocation failed.\n");
+"INVALID: Image dimensions overflow.\n");
+
 goto cleanup;
 }
 
-GDALRasterBandH rasterBand =
-GDALGetRasterBand(datasets[d][b], 1);
+totalPixels = (size_t)width * (size_t)height;
 
-if (GDALRasterIO(
-rasterBand,
-GF_Read,
-0, 0,
-width, height,
-bandData[d][b],
-width, height,
-GDT_Float32,
-0, 0) != CE_None)
+if (totalPixels > SIZE_MAX / sizeof(float) ||
+totalPixels > SIZE_MAX / sizeof(unsigned char))
 {
 fprintf(stderr,
-"ERROR: Cannot read pixels from %s\n",
-filePaths[d][b]);
+"INVALID: Pixel buffer size overflow.\n");
+
+goto cleanup;
+}
+
+printf("\nReading raster metadata and pixel data...\n\n");
+
+for (int d = 0; d < DATE_COUNT; d++)
+{
+for (int b = 0; b < BAND_COUNT; b++)
+{
+if (!getNoDataInformation(
+datasets[d][b],
+&noDataValues[d][b],
+&hasNoData[d][b],
+filePaths[d][b]))
+{
+goto cleanup;
+}
+
+bandData[d][b] =
+malloc(totalPixels * sizeof(float));
+
+bandValid[d][b] =
+malloc(totalPixels * sizeof(unsigned char));
+
+if (bandData[d][b] == NULL ||
+bandValid[d][b] == NULL)
+{
+fprintf(stderr,
+"ERROR: Band memory allocation failed.\n");
+
+goto cleanup;
+}
+
+if (!readBandPixels(
+datasets[d][b],
+bandData[d][b],
+width,
+height,
+filePaths[d][b]))
+{
 goto cleanup;
 }
 
 totalStoredValues += totalPixels;
-
-printf("Stored: %s\n", bandNames[b]);
+}
 }
 
-printf("\n");
-}
+validationPassed = 1;
 
-printf("SUCCESS: All 8 bands are stored in memory.\n");
-printf("Total pixel values stored: %zu\n\n",
+printf("\nVALID FOR COMPARISON\n");
+printf("All 8 files opened successfully.\n");
+printf("Image dimensions: %d x %d\n", width, height);
+printf("CRS and geotransform checks passed.\n");
+printf("All raster pixel data were read successfully.\n");
+printf("Total band pixel values stored: %zu\n\n",
 totalStoredValues);
-
-/* STEP 3: CALCULATE NDWI AND NDVI FOR EVERY PIXEL */
-
-printf("Starting NDWI and NDVI calculations...\n\n");
 
 for (int d = 0; d < DATE_COUNT; d++)
 {
-ndwiData[d] = malloc(totalPixels * sizeof(float));
-ndviData[d] = malloc(totalPixels * sizeof(float));
+size_t totalInvalidBandPixels = 0;
 
-if (ndwiData[d] == NULL || ndviData[d] == NULL)
+printf("Date: %s\n", dates[d]);
+
+for (int b = 0; b < BAND_COUNT; b++)
+{
+size_t validCount = 0;
+size_t invalidCount = 0;
+
+for (size_t i = 0; i < totalPixels; i++)
+{
+int valid = isValidSample(
+bandData[d][b][i],
+noDataValues[d][b],
+hasNoData[d][b]);
+
+bandValid[d][b][i] =
+(unsigned char)valid;
+
+if (valid)
+validCount++;
+else
+invalidCount++;
+}
+
+totalInvalidBandPixels += invalidCount;
+
+printf("%s: valid=%zu, invalid=%zu\n",
+bandNames[b],
+validCount,
+invalidCount);
+}
+
+printf("Total invalid band-pixel entries: %zu\n\n",
+totalInvalidBandPixels);
+}
+
+for (int d = 0; d < DATE_COUNT; d++)
+{
+ndwiData[d] =
+malloc(totalPixels * sizeof(float));
+
+ndviData[d] =
+malloc(totalPixels * sizeof(float));
+
+ndwiValid[d] =
+calloc(totalPixels, sizeof(unsigned char));
+
+ndviValid[d] =
+calloc(totalPixels, sizeof(unsigned char));
+
+if (ndwiData[d] == NULL ||
+ndviData[d] == NULL ||
+ndwiValid[d] == NULL ||
+ndviValid[d] == NULL)
 {
 fprintf(stderr,
 "ERROR: NDWI/NDVI memory allocation failed.\n");
+
 goto cleanup;
 }
 
 size_t validNDWI = 0;
+size_t invalidNDWI = 0;
 size_t validNDVI = 0;
+size_t invalidNDVI = 0;
 
 for (size_t i = 0; i < totalPixels; i++)
 {
@@ -268,44 +664,47 @@ float green = bandData[d][GREEN][i];
 float red = bandData[d][RED][i];
 float nir = bandData[d][NIR][i];
 
-float ndwiDenominator = green + nir;
-float ndviDenominator = nir + red;
+double indexValue;
 
-/* NDWI = (Green - NIR) / (Green + NIR) */
-
-if (ndwiDenominator != 0.0f)
+if (bandValid[d][GREEN][i] &&
+bandValid[d][NIR][i] &&
+calculateIndex(green, nir, &indexValue) &&
+isfinite((float)indexValue))
 {
-ndwiData[d][i] =
-(green - nir) / ndwiDenominator;
-
+ndwiData[d][i] = (float)indexValue;
+ndwiValid[d][i] = 1;
 validNDWI++;
 }
 else
 {
-ndwiData[d][i] = 0.0f;
+ndwiData[d][i] = NAN;
+ndwiValid[d][i] = 0;
+invalidNDWI++;
 }
 
-/* NDVI = (NIR - Red) / (NIR + Red) */
-
-if (ndviDenominator != 0.0f)
+if (bandValid[d][NIR][i] &&
+bandValid[d][RED][i] &&
+calculateIndex(nir, red, &indexValue) &&
+isfinite((float)indexValue))
 {
-ndviData[d][i] =
-(nir - red) / ndviDenominator;
-
+ndviData[d][i] = (float)indexValue;
+ndviValid[d][i] = 1;
 validNDVI++;
 }
 else
 {
-ndviData[d][i] = 0.0f;
+ndviData[d][i] = NAN;
+ndviValid[d][i] = 0;
+invalidNDVI++;
 }
 }
 
-printf("Date: %s\n", dates[d]);
-printf("NDWI calculated for %zu pixels\n", validNDWI);
-printf("NDVI calculated for %zu pixels\n\n", validNDVI);
+printf("Index results for %s:\n", dates[d]);
+printf("NDWI valid pixels: %zu\n", validNDWI);
+printf("NDWI invalid pixels: %zu\n", invalidNDWI);
+printf("NDVI valid pixels: %zu\n", validNDVI);
+printf("NDVI invalid pixels: %zu\n\n", invalidNDVI);
 }
-
-/* STEP 4: DISPLAY SAMPLE PIXEL VALUES */
 
 {
 size_t sample = 0;
@@ -316,52 +715,61 @@ for (int d = 0; d < DATE_COUNT; d++)
 {
 printf("Date: %s\n", dates[d]);
 
-printf("Blue = %.2f\n",
-bandData[d][BLUE][sample]);
-
-printf("Green = %.2f\n",
-bandData[d][GREEN][sample]);
-
-printf("Red = %.2f\n",
-bandData[d][RED][sample]);
-
-printf("NIR = %.2f\n",
-bandData[d][NIR][sample]);
-
-printf("NDWI = %.6f\n",
-ndwiData[d][sample]);
-
-printf("NDVI = %.6f\n\n",
-ndviData[d][sample]);
+for (int b = 0; b < BAND_COUNT; b++)
+{
+if (bandValid[d][b][sample])
+{
+printf("%s = %.2f\n",
+bandNames[b],
+bandData[d][b][sample]);
+}
+else
+{
+printf("%s = INVALID\n", bandNames[b]);
 }
 }
 
-printf("SUCCESS: All band values, NDWI and NDVI "
-"are calculated and stored in memory.\n");
+if (ndwiValid[d][sample])
+printf("NDWI = %.6f\n", ndwiData[d][sample]);
+else
+printf("NDWI = INVALID\n");
+
+if (ndviValid[d][sample])
+printf("NDVI = %.6f\n", ndviData[d][sample]);
+else
+printf("NDVI = INVALID\n");
+
+printf("\n");
+}
+}
+
+printf("SUCCESS: Preprocessing and index calculation completed.\n");
+printf("Validity masks are ready for future water-map generation.\n");
 
 status = EXIT_SUCCESS;
 
 cleanup:
 
-/* STEP 5: FREE MEMORY AND CLOSE FILES */
+if (!validationPassed)
+fprintf(stderr, "\nINVALID FOR COMPARISON\n");
 
 for (int d = 0; d < DATE_COUNT; d++)
 {
 free(ndwiData[d]);
 free(ndviData[d]);
 
+free(ndwiValid[d]);
+free(ndviValid[d]);
+
 for (int b = 0; b < BAND_COUNT; b++)
 {
 free(bandData[d][b]);
+free(bandValid[d][b]);
 
 if (datasets[d][b] != NULL)
-{
 GDALClose(datasets[d][b]);
 }
 }
-}
-
-CPLFree(referenceProjection);
 
 return status;
 }
