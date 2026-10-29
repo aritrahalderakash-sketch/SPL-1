@@ -411,7 +411,119 @@ return 0;
 
 return 1;
 }
+int createWaterMap(
+GDALDatasetH referenceDataset,
+const float *ndwiData,
+const unsigned char *ndwiValid,
+size_t totalPixels,
+int width,
+int height,
+const char *outputPath,
+double threshold)
+{
+GDALDriverH driver = GDALGetDriverByName("GTiff");
 
+if (driver == NULL) {
+fprintf(stderr, "ERROR: GeoTIFF driver unavailable.\n");
+return 0;
+}
+
+unsigned char *waterMap =
+malloc(totalPixels * sizeof(unsigned char));
+
+if (waterMap == NULL) {
+fprintf(stderr, "ERROR: Water-map allocation failed.\n");
+return 0;
+}
+
+size_t waterCount = 0;
+size_t nonWaterCount = 0;
+size_t invalidCount = 0;
+
+for (size_t i = 0; i < totalPixels; i++) {
+if (!ndwiValid[i] || !isfinite(ndwiData[i])) {
+waterMap[i] = 255;
+invalidCount++;
+} else if (ndwiData[i] > threshold) {
+waterMap[i] = 1;
+waterCount++;
+} else {
+waterMap[i] = 0;
+nonWaterCount++;
+}
+}
+
+GDALDatasetH outputDataset = GDALCreate(
+driver,
+outputPath,
+width,
+height,
+1,
+GDT_Byte,
+NULL
+);
+
+if (outputDataset == NULL) {
+fprintf(stderr,
+"ERROR: Cannot create water-map output: %s\n",
+outputPath);
+free(waterMap);
+return 0;
+}
+
+double transform[6];
+
+if (GDALGetGeoTransform(referenceDataset, transform) != CE_None ||
+GDALSetGeoTransform(outputDataset, transform) != CE_None) {
+fprintf(stderr, "ERROR: Cannot preserve geotransform.\n");
+GDALClose(outputDataset);
+free(waterMap);
+return 0;
+}
+
+const char *projection =
+GDALGetProjectionRef(referenceDataset);
+
+if (projection == NULL || projection[0] == '\0' ||
+GDALSetProjection(outputDataset, projection) != CE_None) {
+fprintf(stderr, "ERROR: Cannot preserve CRS.\n");
+GDALClose(outputDataset);
+free(waterMap);
+return 0;
+}
+
+GDALRasterBandH outputBand =
+GDALGetRasterBand(outputDataset, 1);
+
+GDALSetRasterNoDataValue(outputBand, 255);
+
+CPLErr result = GDALRasterIO(
+outputBand,
+GF_Write,
+0, 0,
+width, height,
+waterMap,
+width, height,
+GDT_Byte,
+0, 0
+);
+
+GDALClose(outputDataset);
+free(waterMap);
+
+if (result != CE_None) {
+fprintf(stderr, "ERROR: Failed to write water-map pixels.\n");
+return 0;
+}
+
+printf("\nWater map created: %s\n", outputPath);
+printf("NDWI threshold: %.2f\n", threshold);
+printf("Water pixels: %zu\n", waterCount);
+printf("Non-water pixels: %zu\n", nonWaterCount);
+printf("Invalid pixels: %zu\n", invalidCount);
+
+return 1;
+}
 int main(void)
 {
 GDALAllRegister();
@@ -742,7 +854,19 @@ printf("NDVI = INVALID\n");
 printf("\n");
 }
 }
-
+if (!createWaterMap(
+datasets[0][GREEN],
+ndwiData[0],
+ndwiValid[0],
+totalPixels,
+width,
+height,
+"outputs/2019-01-09_water_map.tif",
+0.0))
+{
+fprintf(stderr, "ERROR: Water-map generation failed.\n");
+goto cleanup;
+}
 printf("SUCCESS: Preprocessing and index calculation completed.\n");
 printf("Validity masks are ready for future water-map generation.\n");
 
