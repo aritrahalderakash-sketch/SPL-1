@@ -867,6 +867,20 @@ height,
 fprintf(stderr, "ERROR: Water-map generation failed.\n");
 goto cleanup;
 }
+
+if (!createWaterMap(
+datasets[1][GREEN],
+ndwiData[1],
+ndwiValid[1],
+totalPixels,
+width,
+height,
+"outputs/2019-01-14_water_map.tif",
+0.0))
+{
+fprintf(stderr, "ERROR: Jan 14 water-map generation failed.\n");
+goto cleanup;
+}
 printf("SUCCESS: Preprocessing and index calculation completed.\n");
 printf("Validity masks are ready for future water-map generation.\n");
 
