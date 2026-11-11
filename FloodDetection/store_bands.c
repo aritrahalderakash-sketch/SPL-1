@@ -627,7 +627,20 @@ goto cleanup;
 }
 }
 }
+validationPassed = 1;
 
+printf("\n====================================\n");
+printf("INPUT VALIDATION SUCCESSFUL!\n");
+printf("====================================\n");
+
+printf("All 8 TIFF files opened successfully.\n");
+printf("Raster band count validation passed.\n");
+printf("Image dimensions: %d x %d\n", width, height);
+printf("Georeferencing information validated.\n");
+printf("Grid alignment validation passed.\n");
+printf("Coordinate Reference System validation passed.\n");
+
+printf("\nAll input images are valid for comparison.\n\n");
 if ((size_t)width > SIZE_MAX / (size_t)height)
 {
 fprintf(stderr,
